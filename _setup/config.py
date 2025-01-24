@@ -1,4 +1,11 @@
 # Databricks notebook source
+# DBTITLE 1,Install Dependencies
+# MAGIC %pip install pytesseract==0.3.10 PyMuPDF==1.23.25
+# MAGIC
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
 # Note these resources need to be set up manually, creation is not included in ref code
 
 UC_CATALOG = "main"
