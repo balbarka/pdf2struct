@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md 
 # MAGIC
-# MAGIC # pytesseract_batch_simple
+# MAGIC # pytesseract_incremental_batch
 # MAGIC
 # MAGIC This notebook will read all files in our source volumes directory and create a delta table with all of the text as a field. The notebook is organized as follows:
 # MAGIC  * **Install Dependencies & Set Configs**: Called using **%run**
@@ -41,14 +41,19 @@ from PIL import Image
 import base64
 from io import BytesIO
 
-def pdf_to_png(pdf_name):
+import pytesseract
+
+# This this is different than how implemented in batch because it will read the pdf from content
+# instead of open the file
+
+def pdf_to_png(pdf_binary):
   return_pngs = []
-  with fitz.open(pdf_name) as doc:
-        for i, page in enumerate(doc):
-          page = doc.load_page(i)
-          pixmap = page.get_pixmap(dpi=300)
-          img = Image.open(io.BytesIO(pixmap.tobytes()))
-          return_pngs.append(img)
+  doc = fitz.open("pdf", pdf_binary)
+  for i, page in enumerate(doc):
+      page = doc.load_page(i)
+      pixmap = page.get_pixmap(dpi=300)
+      img = Image.open(io.BytesIO(pixmap.tobytes()))
+      return_pngs.append(img)
   return return_pngs
 
 def image_to_b64string(image: Image, format:str = "JPEG", encoding:str = "utf-8") -> str:
@@ -81,8 +86,8 @@ def split_pages( batches : Iterator[pd.Series]) -> Iterator[pd.Series]:
     for batch in batches:
         #batch -> list of filenames
         batch_pages = []
-        for file_name in batch.tolist():    
-            pages = pdf_to_png(file_name)
+        for pdf_binary in batch.tolist():    
+            pages = pdf_to_png(pdf_binary)
             file_pages = []
             for i in range(len(pages)):
                 img_str = image_to_b64string(pages[i])
@@ -97,17 +102,6 @@ def split_pages( batches : Iterator[pd.Series]) -> Iterator[pd.Series]:
         yield pd.Series(batch_pages)
 
 import pytesseract
-
-@pandas_udf(returnType=StringType())
-def extract_text(batches: Iterator[pd.Series]) -> Iterator[pd.Series]:
-    for batch in batches:
-        #batch -> list of page img str
-        batch_result = []
-        for page_img_str in batch.tolist():     
-            page_img = b64string_to_image(page_img_str)
-            result = pytesseract.image_to_string(page_img)        
-            batch_result.append(result)
-        yield pd.Series(batch_result)
 
 @pandas_udf(returnType=StringType())
 def extract_text(batches: Iterator[pd.Series]) -> Iterator[pd.Series]:
@@ -148,134 +142,54 @@ def extract_names_expr(context_col: str="content",
 
 # MAGIC %md
 # MAGIC
-# MAGIC ### Define spark dataframes
+# MAGIC # Set Incremental Batch Configurations
 # MAGIC
-# MAGIC While a single spark dataframe could be defined for the whole process, we will include intermediate definitions for ease of inspection and debugging. Those dataframes are defined in the following order:
 # MAGIC
-# MAGIC | name | description |
-# MAGIC | ---- | ----------- |
-# MAGIC | `paths_df` | A lisiting of all the pdf files that will be read into text. For batch, we'll use [dbutils](https://docs.databricks.com/en/dev-tools/databricks-utils.html). |
-# MAGIC | `pages_df` | A dataframe of all pdfs read into jpeg as string and exploded by page (meaning one record per page) |
-# MAGIC | 'df' | desc |
-
-# COMMAND ----------
-
-# DBTITLE 1,paths_df
-paths_lst = [file.path.replace("dbfs:","") for file in dbutils.fs.ls(PDF_VOLUME_PATH)]
-paths_df = spark.createDataFrame(pd.DataFrame({ "path" : paths_lst}))
-
-display(paths_df)
-
-# COMMAND ----------
-
-# DBTITLE 1,pages_df
-from pyspark.sql.functions import col
-
-pages_df = paths_df.withColumn("pages", split_pages("path")) \
-                   .withColumn("page", explode("pages")) \
-                   .drop("pages")
-
-display(pages_df)
-
-# COMMAND ----------
-
-text_df = pages_df.withColumn("content",extract_text("page.page_encoded_img")) \
-                  .select("path",
-                          col("page.page_number").alias("page_number"),
-                          "content")
-
-display(text_df)
-
-# COMMAND ----------
-
-text_df.cache()
-
-# COMMAND ----------
-
-from pyspark.sql.functions import expr
-extract_df = text_df.withColumn("extract", from_json(expr(extract_names_expr()), json_extract_schema))
-
-display(extract_df)
-
-# COMMAND ----------
-
-from pyspark.sql.functions import col, struct, collect_list, min, max, collect_list
-from pyspark.sql.window import Window
-
-# Define the window specification
-# window_spec = Window.partitionBy("path")
-
-# Create the nested struct and page_range columns
-collect_df = spark.table("main.default.pdf_content") \
-                  .withColumn("doc_extract", struct(col("path"),
-                                                    col("extract"))) \
-                  .groupBy("doc_extract") \
-                  .agg(collect_list("content").alias('contents'),
-                       collect_list("page_number").alias('pages'))
-
-display(collect_df)
-
-# COMMAND ----------
-
-from pyspark.sql.functions import col
-
-# Create the nested struct and page_range columns
-collect_flat_df = collect_df.select(col("doc_extract.path").alias("path"),
-                                    col("doc_extract.extract.firstname").alias("firstname"),
-                                    col("doc_extract.extract.lastname").alias("lastname"),
-                                    col("contents"), col("pages"))
-
-
-
-display(collect_flat_df)
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC
-# MAGIC ### Save Dataframe to Delta
-# MAGIC
-# MAGIC Now we can save the entire Dataframe to delta to have it persisted. It is not necessary to stop here, we could keep adding additional transforms.
 
 # COMMAND ----------
 
-PDF_TABLE_NAME
+print("PDF_VOLUME_PATH: " + PDF_VOLUME_PATH)
+print("CP_VOLUME_PATH: " + CP_VOLUME_PATH)
+print("PDF_STREAMING_TABLE_NAME: " + PDF_STREAMING_TABLE_NAME)
 
 # COMMAND ----------
 
-extract_df.write.mode("overwrite").saveAsTable(PDF_TABLE_NAME)
+from pyspark.sql.functions import input_file_name
 
-display(spark.sql(f"SELECT * FROM {PDF_TABLE_NAME}"))
+PDF_VOLUME_PATH = "/Volumes/main/default/pdf_source"
+CP_VOLUME_PATH = "/Volumes/main/default/pdf_checkpoint"
+PDF_STREAMING_TABLE_NAME = "main.default.pdf_content_streaming"
 
-# COMMAND ----------
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract" 
 
-# MAGIC %md
-# MAGIC
-# MAGIC ### All together
-# MAGIC
-# MAGIC This is what the workflow looks like written in a single command:
+# Read PDF files as a stream from UC Volume
+df = (
+    spark.readStream
+    .format("cloudFiles")  # Auto Loader
+    .option("cloudFiles.format", "binaryFile")  # Read as binary files
+    .load(PDF_VOLUME_PATH)
+    .withColumn("file_path", input_file_name())  # Capture file path
+    .withColumn("pages", split_pages("content"))
+    .withColumn("page", explode("pages"))
+    .withColumn("page_number", col("page.page_number"))
+    .withColumn("content",extract_text("page.page_encoded_img"))
+    .withColumn("extract", from_json(expr(extract_names_expr()), json_extract_schema))
+    .drop("pages").drop("page")
+)
 
-# COMMAND ----------
+query = (
+    df.writeStream
+    .format("delta")
+    .outputMode("append")  # Append-only mode
+    .option("checkpointLocation", CP_VOLUME_PATH)  # Required for fault tolerance
+    .trigger(once=True)  # Process all available data and then stop
+    .toTable(PDF_STREAMING_TABLE_NAME)  # Write to Delta table
+)
 
-dat = spark.createDataFrame(pd.DataFrame({ "path" : paths_lst})) \
-           .withColumn("pages", split_pages("path")) \
-           .withColumn("page", explode("pages")) \
-           .withColumn("page_number", col("page.page_number")) \
-           .withColumn("content",extract_text("page.page_encoded_img")) \
-           .withColumn("extract", from_json(expr(extract_names_expr()), json_extract_schema)) \
-           .drop("pages").drop("page")
-
-display(dat)
-
+query.awaitTermination()
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC
-# MAGIC SELECT extract.firstname,
-# MAGIC        extract.lastname FROM main.default.pdf_content;
-# MAGIC
-
-# COMMAND ----------
-
-
+# MAGIC SELECT * FROM main.default.pdf_content_streaming;
